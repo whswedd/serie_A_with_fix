@@ -1,10 +1,10 @@
-name: Extract Serie A starting XIs (FotMob HTML)
+name: Diagnose FotMob Serie A lineup structure (v6)
 
 on:
   workflow_dispatch:
     inputs:
       season:
-        description: "Season to extract"
+        description: "Season to inspect"
         required: true
         default: "2021-22"
         type: choice
@@ -14,52 +14,49 @@ on:
           - "2023-24"
           - "2024-25"
           - "2025-26"
-          - "all"
 
 permissions:
   contents: read
 
 jobs:
-  extract:
+  diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 20
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Extract lineups
-        run: python extract_serie_a_lineups.py --season "${{ inputs.season }}"
+      - name: Diagnose first match only
+        run: |
+          python diagnose_fotmob_lineup.py \
+            --season "${{ inputs.season }}"
 
-      - name: Show coverage
+      - name: Show diagnostic files
         if: always()
         run: |
-          echo "Processed files:"
-          ls -lh data/processed || true
+          echo "Diagnostic files:"
+          find data/diagnostics -maxdepth 1 -type f -printf "%f  %s bytes\n" | sort || true
           echo
-          cat data/processed/serie_a_lineup_coverage.csv | tail -20 || true
+          echo "Candidate containers:"
+          cat data/diagnostics/candidate_containers.txt || true
+          echo
+          echo "Keyword paths:"
+          head -200 data/diagnostics/keyword_paths.txt || true
 
-      - name: Upload CSV outputs
+      - name: Upload diagnostic artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: serie-a-lineups-${{ inputs.season }}
-          path: |
-            data/processed/*.csv
+          name: fotmob-lineup-diagnostics-${{ inputs.season }}
+          path: data/diagnostics/
           if-no-files-found: warn
-          retention-days: 30
-
-      - name: Upload failed-match HTML cache
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: diagnostic-html-${{ inputs.season }}
-          path: |
-            data/raw/fotmob/
-          if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 14
