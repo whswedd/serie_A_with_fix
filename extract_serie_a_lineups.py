@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from playwright.sync_api import sync_playwright
 
-BASE = 'https://www.sofascore.com/api/v1'
+BASE = 'https://api.sofascore.com/api/v1'
 TOURNAMENT_ID = 23
 SEASON_IDS = {
     '2021-22': 37475,
@@ -58,6 +58,9 @@ def browser_json(page, url: str, cache: Path, force=False, retries=5):
 def event_url(season_id, rnd):
     return f'{BASE}/unique-tournament/{TOURNAMENT_ID}/season/{season_id}/events/round/{rnd}'
 
+def last_events_url(season_id, page_no):
+    return f'{BASE}/unique-tournament/{TOURNAMENT_ID}/season/{season_id}/events/last/{page_no}'
+
 def lineup_url(event_id): return f'{BASE}/event/{event_id}/lineups'
 
 def extract_match(ev, season, rnd):
@@ -94,18 +97,68 @@ def main():
         context=browser.new_context(user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36')
         page=context.new_page()
         print('Opening Sofascore in Chromium to establish browser session...')
-        page.goto('https://www.sofascore.com/', wait_until='domcontentloaded', timeout=60000)
+        page.goto('https://api.sofascore.com/', wait_until='domcontentloaded', timeout=60000)
         page.wait_for_timeout(5000)
         matches=[]
         for season in args.seasons:
             sid=SEASON_IDS[season]; print(f'\n{season}: season id {sid}')
+            season_matches=[]
+            round_failed=False
+
+            # Preferred discovery: round endpoints.
             for rnd in ROUNDS:
-                data=browser_json(page,event_url(sid,rnd),RAW/'events'/season/f'round_{rnd:02d}.json',args.force)
-                events=data.get('events',[]); print(f'  round {rnd:02d}: {len(events)} events')
-                matches += [extract_match(e,season,rnd) for e in events if e.get('id')]
+                try:
+                    data=browser_json(page,event_url(sid,rnd),RAW/'events'/season/f'round_{rnd:02d}.json',args.force)
+                    events=data.get('events',[]); print(f'  round {rnd:02d}: {len(events)} events')
+                    season_matches += [extract_match(e,season,rnd) for e in events if e.get('id')]
+                except Exception as e:
+                    print(f'  Round endpoint failed for {season} round {rnd}: {e}')
+                    round_failed=True
+                    break
+
+            # Fallback: historical paginated event list.
+            if round_failed or len({m["event_id"] for m in season_matches}) < 300:
+                print(f'  Falling back to paginated season events for {season}...')
+                season_matches=[]
+                seen=set()
+                for page_no in range(0, 60):
+                    try:
+                        data=browser_json(page,last_events_url(sid,page_no),
+                                          RAW/'events_last'/season/f'page_{page_no:02d}.json',
+                                          args.force)
+                    except Exception as e:
+                        print(f'  page {page_no}: failed: {e}')
+                        if page_no == 0:
+                            raise
+                        break
+
+                    events=data.get('events',[])
+                    if not events:
+                        print(f'  page {page_no}: 0 events; stopping')
+                        break
+
+                    added=0
+                    for ev in events:
+                        eid=ev.get('id')
+                        if not eid or eid in seen:
+                            continue
+                        seen.add(eid)
+                        ri=ev.get('roundInfo') or {}
+                        rnd=ri.get('round') or ri.get('roundNumber') or ''
+                        season_matches.append(extract_match(ev,season,rnd))
+                        added += 1
+                    print(f'  page {page_no}: {len(events)} events, {added} new')
+
+                    # SofaScore usually signals whether another page exists.
+                    if data.get('hasNextPage') is False:
+                        break
+
+                print(f'  fallback discovered {len(seen)} unique events')
+
+            matches += season_matches
         # de-dupe
         matches=list({int(m['event_id']):m for m in matches}.values())
-        matches.sort(key=lambda x:(x['season'],x['round'],x['kickoff_utc']))
+        matches.sort(key=lambda x:(x['season'],x['kickoff_utc'],str(x['round'])))
         xi=[]; coverage=[]
         for k,m in enumerate(matches,1):
             eid=int(m['event_id']); print(f'Lineups {k}/{len(matches)}: {m["home_team"]} v {m["away_team"]} ({eid})')

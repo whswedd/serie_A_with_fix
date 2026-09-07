@@ -1,3 +1,33 @@
+## v4: dedicated API host + event-list fallback
+
+This version uses `https://api.sofascore.com/api/v1`.
+
+For each season it first tries the normal round endpoint. If that fails, or returns
+an implausibly small season, it automatically falls back to:
+
+`/unique-tournament/23/season/{season_id}/events/last/{page}`
+
+and discovers matches page-by-page before downloading `/event/{event_id}/lineups`.
+
+This makes the extractor resilient to SofaScore disabling one match-discovery route.
+
+## v3 API-host fix
+
+This version uses the dedicated SofaScore API host:
+
+`https://api.sofascore.com/api/v1`
+
+rather than routing API calls through `www.sofascore.com`.
+
+If an older repository contains URLs beginning with:
+
+`https://www.sofascore.com/api/v1`
+
+replace them with:
+
+`https://api.sofascore.com/api/v1`
+
+
 # Serie A Sofascore starting-XI extractor (browser version)
 
 This version uses Playwright/Chromium because direct HTTP requests to Sofascore can receive a 403 challenge.
