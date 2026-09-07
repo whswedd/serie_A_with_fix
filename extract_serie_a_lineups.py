@@ -1,181 +1,394 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+"""
+Extract historical Serie A starting XIs from FotMob HTML pages.
 
-import argparse, csv, json, re, time
-from datetime import datetime, timezone
+Why HTML instead of the JSON API?
+FotMob's protected matchDetails API can return 403 to automated clients.
+The normal league/match web pages still contain the required data in the
+Next.js __NEXT_DATA__ JSON embedded in the HTML.
+
+Outputs:
+  data/processed/serie_a_matches.csv
+  data/processed/serie_a_starting_xi.csv
+  data/processed/serie_a_lineup_coverage.csv
+  data/processed/missing_lineups.csv
+"""
+
+from __future__ import annotations
+import argparse, csv, json, random, re, time
 from pathlib import Path
 from typing import Any
-from playwright.sync_api import sync_playwright
+from urllib.parse import urljoin
 
-BASE = 'https://api.sofascore.com/api/v1'
-TOURNAMENT_ID = 23
-SEASON_IDS = {
-    '2021-22': 37475,
-    '2022-23': 42415,
-    '2023-24': 52760,
-    '2024-25': 63515,
-    '2025-26': 76457,
+import requests
+
+BASE = "https://www.fotmob.com"
+LEAGUE_ID = 55
+SEASONS = ["2021-22","2022-23","2023-24","2024-25","2025-26"]
+SEASON_QUERY = {
+    "2021-22":"2021-2022",
+    "2022-23":"2022-2023",
+    "2023-24":"2023-2024",
+    "2024-25":"2024-2025",
+    "2025-26":"2025-2026",
 }
-ROUNDS = range(1, 39)
-ROOT = Path(__file__).resolve().parent
-RAW = ROOT/'data'/'raw'
-OUT = ROOT/'data'/'processed'
-POSITION_MAP = {'G':'GK','GK':'GK','D':'DEF','DF':'DEF','DEF':'DEF','M':'MID','MF':'MID','MID':'MID','F':'FWD','FW':'FWD','FWD':'FWD'}
+OUT = Path("data/processed")
+RAW = Path("data/raw/fotmob")
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
 
-def iso_utc(ts: Any) -> str:
-    try: return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
-    except Exception: return ''
+def season_url(season: str) -> str:
+    return f"{BASE}/leagues/{LEAGUE_ID}/overview/serie?season={SEASON_QUERY[season]}"
 
-def write_csv(path: Path, rows: list[dict], fields: list[str]):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('w', newline='', encoding='utf-8') as f:
-        w=csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(rows)
+def clean_slug(slug: str) -> str:
+    if not slug:
+        return ""
+    if slug.startswith("http"):
+        return slug
+    return urljoin(BASE, slug)
 
-def browser_json(page, url: str, cache: Path, force=False, retries=5):
+def request_html(session: requests.Session, url: str, cache: Path,
+                 retries: int = 6, force: bool = False) -> str:
     if cache.exists() and not force:
-        return json.loads(cache.read_text(encoding='utf-8'))
+        return cache.read_text(encoding="utf-8", errors="replace")
+
     cache.parent.mkdir(parents=True, exist_ok=True)
-    last=None
-    for attempt in range(retries):
+    last = None
+    for attempt in range(1, retries+1):
         try:
-            result = page.evaluate("""async (url) => {
-              const r = await fetch(url, {credentials:'include', headers:{'accept':'application/json,text/plain,*/*'}});
-              const text = await r.text();
-              return {status:r.status, text};
-            }""", url)
-            status=result['status']
-            if status != 200:
-                raise RuntimeError(f'HTTP {status}: {result["text"][:300]}')
-            data=json.loads(result['text'])
-            cache.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
-            time.sleep(0.35)
-            return data
+            r = session.get(url, timeout=45)
+            print(f"    GET {r.status_code} {url}")
+            if r.status_code == 200 and "__NEXT_DATA__" in r.text:
+                cache.write_text(r.text, encoding="utf-8")
+                return r.text
+            last = RuntimeError(
+                f"status={r.status_code}, len={len(r.text)}, "
+                f"next_data={'__NEXT_DATA__' in r.text}"
+            )
         except Exception as e:
-            last=e; print(f'Attempt {attempt+1}/{retries} failed for {url}: {e}')
-            time.sleep(min(15, 2**attempt))
-    raise RuntimeError(f'Failed after {retries} attempts: {url}') from last
+            last = e
+        if attempt < retries:
+            time.sleep(min(30, (2**(attempt-1))) + random.uniform(.5, 1.5))
+    raise RuntimeError(f"Failed after {retries} attempts: {url}; last={last}")
 
-def event_url(season_id, rnd):
-    return f'{BASE}/unique-tournament/{TOURNAMENT_ID}/season/{season_id}/events/round/{rnd}'
+def next_data(html: str) -> dict:
+    m = re.search(
+        r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+        html, flags=re.S
+    )
+    if not m:
+        raise ValueError("__NEXT_DATA__ script not found")
+    wrapper = json.loads(m.group(1))
+    return wrapper.get("props", {}).get("pageProps", {})
 
-def last_events_url(season_id, page_no):
-    return f'{BASE}/unique-tournament/{TOURNAMENT_ID}/season/{season_id}/events/last/{page_no}'
+def find_allmatches(obj: Any):
+    """Find the largest plausible allMatches list anywhere in pageProps."""
+    found = []
+    def walk(x):
+        if isinstance(x, dict):
+            for k,v in x.items():
+                if k == "allMatches" and isinstance(v, list):
+                    found.append(v)
+                else:
+                    walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(obj)
+    if not found:
+        return []
+    return max(found, key=len)
 
-def lineup_url(event_id): return f'{BASE}/event/{event_id}/lineups'
+def first(d: dict, *names, default=None):
+    for n in names:
+        if n in d and d[n] is not None:
+            return d[n]
+    return default
 
-def extract_match(ev, season, rnd):
-    h=ev.get('homeTeam') or {}; a=ev.get('awayTeam') or {}
-    hs=ev.get('homeScore') or {}; as_=ev.get('awayScore') or {}
-    return {'season':season,'round':rnd,'event_id':ev.get('id'),'kickoff_utc':iso_utc(ev.get('startTimestamp')),
-            'home_team':h.get('name',''),'home_team_id':h.get('id',''),'away_team':a.get('name',''),'away_team_id':a.get('id',''),
-            'status':(ev.get('status') or {}).get('type',''),'home_goals':hs.get('current',''),'away_goals':as_.get('current','')}
+def nested_name(x):
+    if isinstance(x, str): return x
+    if not isinstance(x, dict): return None
+    n = x.get("name")
+    if isinstance(n, str): return n
+    if isinstance(n, dict):
+        return n.get("fullName") or n.get("name")
+    return x.get("fullName") or x.get("shortName")
 
-def get_position(entry):
-    p=entry.get('player') or {}
-    raw=entry.get('position') or p.get('position') or (entry.get('statistics') or {}).get('position') or ''
-    return POSITION_MAP.get(str(raw).upper(), str(raw).upper())
+def match_row(m: dict, season: str) -> dict:
+    home = m.get("home") or m.get("homeTeam") or {}
+    away = m.get("away") or m.get("awayTeam") or {}
+    status = m.get("status") or {}
+    return {
+        "Season": season,
+        "MatchID": first(m, "id", "matchId"),
+        "DateUTC": first(status, "utcTime", default=first(m, "matchTimeUTCDate","date")),
+        "Round": first(m, "round", "roundName", "roundId", default=""),
+        "Home": nested_name(home) or first(m,"homeName", default=""),
+        "Away": nested_name(away) or first(m,"awayName", default=""),
+        "HomeTeamID": first(home,"id","teamId", default=""),
+        "AwayTeamID": first(away,"id","teamId", default=""),
+        "PageURL": clean_slug(first(m,"pageUrl","pageURL","url", default="")),
+    }
 
-def parse_side(obj, side, m):
-    players=(obj or {}).get('players') or []
-    starters=[]
-    for i,e in enumerate(players):
-        p=e.get('player') or e
-        is_sub=e.get('substitute', e.get('isSubstitute', False))
-        if is_sub: continue
-        starters.append({'season':m['season'],'round':m['round'],'event_id':m['event_id'],'kickoff_utc':m['kickoff_utc'],
-                         'home_team':m['home_team'],'away_team':m['away_team'],'side':side,
-                         'player_id':p.get('id',''),'player_name':p.get('name',''),'position':get_position(e),
-                         'shirt_number':e.get('shirtNumber', p.get('jerseyNumber','')),'starter_order':len(starters)+1})
-    # Fallback for responses without explicit substitute flag: first 11 are starters.
-    return starters[:11]
+def get_lineup_obj(pageprops: dict):
+    content = pageprops.get("content") or {}
+    if isinstance(content, dict) and "lineup" in content:
+        return content.get("lineup") or {}
+    # fallback recursive lookup
+    stack=[pageprops]
+    while stack:
+        x=stack.pop()
+        if isinstance(x,dict):
+            if "lineup" in x and isinstance(x["lineup"],dict):
+                return x["lineup"]
+            stack.extend(x.values())
+        elif isinstance(x,list):
+            stack.extend(x)
+    return {}
+
+def player_name(p: dict):
+    for key in ("name","playerName","fullName"):
+        v=p.get(key)
+        if isinstance(v,str): return v
+        if isinstance(v,dict):
+            z=v.get("fullName") or v.get("name")
+            if z: return z
+    pl=p.get("player")
+    if isinstance(pl,dict):
+        return player_name(pl)
+    return ""
+
+def player_id(p: dict):
+    for key in ("id","playerId"):
+        if p.get(key) is not None:
+            return p.get(key)
+    pl=p.get("player")
+    if isinstance(pl,dict):
+        return pl.get("id") or pl.get("playerId")
+    return ""
+
+def player_position(p: dict):
+    for key in ("position","positionId","positionLabel","role"):
+        v=p.get(key)
+        if isinstance(v,str): return v
+        if isinstance(v,dict):
+            return v.get("label") or v.get("name") or v.get("shortName") or ""
+        if v is not None: return str(v)
+    pl=p.get("player")
+    if isinstance(pl,dict):
+        return player_position(pl)
+    return ""
+
+def is_bench_player(p: dict) -> bool:
+    # Explicit flags where available.
+    if p.get("isStarter") is True or p.get("starter") is True:
+        return False
+    if p.get("isStarter") is False or p.get("starter") is False:
+        return True
+    if p.get("isSubstitute") is True or p.get("substitute") is True:
+        return True
+    return False
+
+def flatten_players(x):
+    """Yield player-like dicts from nested lineup arrays without duplicating them."""
+    out=[]
+    seen=set()
+    def walk(v):
+        if isinstance(v,dict):
+            pid=player_id(v); nm=player_name(v)
+            playerish = bool(pid or nm) and any(
+                k in v for k in ("position","positionId","shirt","shirtNumber",
+                                 "playerId","isStarter","starter","isSubstitute")
+            )
+            if playerish:
+                key=(str(pid),nm)
+                if key not in seen:
+                    seen.add(key); out.append(v)
+            else:
+                for z in v.values(): walk(z)
+        elif isinstance(v,list):
+            for z in v: walk(z)
+    walk(x)
+    return out
+
+def parse_starting_xi(pageprops: dict, match: dict):
+    lineup=get_lineup_obj(pageprops)
+    rows=[]
+    if not lineup:
+        return rows
+
+    home_id=str(match["HomeTeamID"])
+    away_id=str(match["AwayTeamID"])
+
+    # Modern shape: lineup.lineups = [{teamId, teamName, players:[...]} ...]
+    teams = lineup.get("lineups")
+    if isinstance(teams,list):
+        for t in teams:
+            tid=str(first(t,"teamId","id", default=""))
+            side = "Home" if tid==home_id else ("Away" if tid==away_id else "")
+            tname=first(t,"teamName","name", default="")
+            players=t.get("players") or t.get("lineup") or []
+            # In this structure players are typically the XI. Filter explicit bench flags anyway.
+            plist=[p for p in flatten_players(players) if not is_bench_player(p)]
+            # Prefer first 11 if nested data added duplicates/extras.
+            if len(plist)>11:
+                starter_flagged=[p for p in plist if p.get("isStarter") is True or p.get("starter") is True]
+                if len(starter_flagged)==11: plist=starter_flagged
+                else: plist=plist[:11]
+            for seq,p in enumerate(plist,1):
+                rows.append(make_player_row(match,side,tname,seq,p))
+        if rows:
+            return rows
+
+    # Older shape commonly has a paired starting lineup array plus paired bench arrays.
+    # Search named keys that imply STARTERS, explicitly excluding bench/substitute keys.
+    candidate_arrays=[]
+    def collect_named(d):
+        if isinstance(d,dict):
+            for k,v in d.items():
+                kl=k.lower()
+                if isinstance(v,list) and ("lineup" in kl or "starter" in kl):
+                    if "bench" not in kl and "sub" not in kl:
+                        candidate_arrays.append((k,v))
+                elif isinstance(v,(dict,list)):
+                    collect_named(v)
+        elif isinstance(d,list):
+            for v in d: collect_named(v)
+    collect_named(lineup)
+
+    for _,arr in candidate_arrays:
+        # Often [homeXI, awayXI]
+        if len(arr)==2 and all(isinstance(z,list) for z in arr):
+            for side,tname,players in [
+                ("Home",match["Home"],arr[0]),("Away",match["Away"],arr[1])
+            ]:
+                plist=[p for p in flatten_players(players) if not is_bench_player(p)][:11]
+                for seq,p in enumerate(plist,1):
+                    rows.append(make_player_row(match,side,tname,seq,p))
+            if rows:
+                return rows
+
+    return rows
+
+def make_player_row(match, side, team_name, seq, p):
+    return {
+        "Season":match["Season"],"MatchID":match["MatchID"],
+        "DateUTC":match["DateUTC"],"Round":match["Round"],
+        "Home":match["Home"],"Away":match["Away"],
+        "Side":side,"Team":team_name,"StarterNo":seq,
+        "PlayerID":player_id(p),"Player":player_name(p),
+        "Position":player_position(p),
+        "ShirtNumber":first(p,"shirtNumber","shirt", default=""),
+        "PageURL":match["PageURL"],
+    }
+
+def write_csv(path: Path, rows, fields):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w=csv.DictWriter(f, fieldnames=fields)
+        w.writeheader(); w.writerows(rows)
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('--force', action='store_true'); ap.add_argument('--seasons', nargs='*', default=list(SEASON_IDS))
-    args=ap.parse_args(); OUT.mkdir(parents=True, exist_ok=True)
-    with sync_playwright() as pw:
-        browser=pw.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage'])
-        context=browser.new_context(user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36')
-        page=context.new_page()
-        print('Opening Sofascore in Chromium to establish browser session...')
-        page.goto('https://api.sofascore.com/', wait_until='domcontentloaded', timeout=60000)
-        page.wait_for_timeout(5000)
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--season", choices=["all"]+SEASONS, default="all")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--delay-min", type=float, default=0.8)
+    ap.add_argument("--delay-max", type=float, default=1.5)
+    args=ap.parse_args()
+    seasons=SEASONS if args.season=="all" else [args.season]
+
+    session=requests.Session()
+    session.headers.update(HEADERS)
+
+    all_matches=[]
+    all_players=[]
+    missing=[]
+
+    for season in seasons:
+        print(f"\n=== {season} ===")
+        html=request_html(session, season_url(season),
+                          RAW/"league"/f"{season}.html", force=args.force)
+        props=next_data(html)
+        raw_matches=find_allmatches(props)
         matches=[]
-        for season in args.seasons:
-            sid=SEASON_IDS[season]; print(f'\n{season}: season id {sid}')
-            season_matches=[]
-            round_failed=False
+        for m in raw_matches:
+            row=match_row(m,season)
+            if row["MatchID"] and row["Home"] and row["Away"]:
+                matches.append(row)
 
-            # Preferred discovery: round endpoints.
-            for rnd in ROUNDS:
-                try:
-                    data=browser_json(page,event_url(sid,rnd),RAW/'events'/season/f'round_{rnd:02d}.json',args.force)
-                    events=data.get('events',[]); print(f'  round {rnd:02d}: {len(events)} events')
-                    season_matches += [extract_match(e,season,rnd) for e in events if e.get('id')]
-                except Exception as e:
-                    print(f'  Round endpoint failed for {season} round {rnd}: {e}')
-                    round_failed=True
-                    break
+        # Deduplicate by MatchID.
+        uniq={str(m["MatchID"]):m for m in matches}
+        matches=list(uniq.values())
+        matches.sort(key=lambda z: str(z["DateUTC"]))
+        print(f"  Discovered {len(matches)} matches")
+        if len(matches)<350:
+            print("  WARNING: fewer than 350 matches discovered; check league page cache.")
 
-            # Fallback: historical paginated event list.
-            if round_failed or len({m["event_id"] for m in season_matches}) < 300:
-                print(f'  Falling back to paginated season events for {season}...')
-                season_matches=[]
-                seen=set()
-                for page_no in range(0, 60):
-                    try:
-                        data=browser_json(page,last_events_url(sid,page_no),
-                                          RAW/'events_last'/season/f'page_{page_no:02d}.json',
-                                          args.force)
-                    except Exception as e:
-                        print(f'  page {page_no}: failed: {e}')
-                        if page_no == 0:
-                            raise
-                        break
-
-                    events=data.get('events',[])
-                    if not events:
-                        print(f'  page {page_no}: 0 events; stopping')
-                        break
-
-                    added=0
-                    for ev in events:
-                        eid=ev.get('id')
-                        if not eid or eid in seen:
-                            continue
-                        seen.add(eid)
-                        ri=ev.get('roundInfo') or {}
-                        rnd=ri.get('round') or ri.get('roundNumber') or ''
-                        season_matches.append(extract_match(ev,season,rnd))
-                        added += 1
-                    print(f'  page {page_no}: {len(events)} events, {added} new')
-
-                    # SofaScore usually signals whether another page exists.
-                    if data.get('hasNextPage') is False:
-                        break
-
-                print(f'  fallback discovered {len(seen)} unique events')
-
-            matches += season_matches
-        # de-dupe
-        matches=list({int(m['event_id']):m for m in matches}.values())
-        matches.sort(key=lambda x:(x['season'],x['kickoff_utc'],str(x['round'])))
-        xi=[]; coverage=[]
-        for k,m in enumerate(matches,1):
-            eid=int(m['event_id']); print(f'Lineups {k}/{len(matches)}: {m["home_team"]} v {m["away_team"]} ({eid})')
+        for i,m in enumerate(matches,1):
+            print(f"  [{i:03d}/{len(matches):03d}] {m['Home']} vs {m['Away']}")
+            if not m["PageURL"]:
+                missing.append({**m,"Reason":"No PageURL in league page"})
+                continue
             try:
-                data=browser_json(page,lineup_url(eid),RAW/'lineups'/m['season']/f'{eid}.json',args.force)
-                h=parse_side(data.get('home'), 'home', m); a=parse_side(data.get('away'),'away',m)
+                html=request_html(
+                    session,m["PageURL"],
+                    RAW/"matches"/season/f"{m['MatchID']}.html",
+                    force=args.force
+                )
+                props=next_data(html)
+                players=parse_starting_xi(props,m)
+                hc=sum(1 for p in players if p["Side"]=="Home")
+                ac=sum(1 for p in players if p["Side"]=="Away")
+                print(f"       starters: home={hc}, away={ac}")
+                if hc!=11 or ac!=11:
+                    missing.append({**m,"Reason":f"Parsed starters home={hc}, away={ac}"})
+                all_players.extend(players)
             except Exception as e:
-                print(f'  WARNING lineup failed: {e}'); h=[]; a=[]
-            xi += h+a
-            coverage.append({'season':m['season'],'round':m['round'],'event_id':eid,'home_team':m['home_team'],'away_team':m['away_team'],
-                             'home_starters':len(h),'away_starters':len(a),'complete_22':int(len(h)==11 and len(a)==11)})
-        browser.close()
-    write_csv(OUT/'serie_a_matches.csv',matches,list(matches[0].keys()))
-    fields=['season','round','event_id','kickoff_utc','home_team','away_team','side','player_id','player_name','position','shirt_number','starter_order']
-    write_csv(OUT/'serie_a_starting_xi.csv',xi,fields)
-    write_csv(OUT/'serie_a_lineup_coverage.csv',coverage,list(coverage[0].keys()))
-    complete=sum(r['complete_22'] for r in coverage)
-    print(f'\nDone: {len(matches)} matches, {len(xi)} starter rows, {complete}/{len(coverage)} complete 22-player lineups')
+                print(f"       ERROR: {e}")
+                missing.append({**m,"Reason":str(e)})
+            time.sleep(random.uniform(args.delay_min,args.delay_max))
 
-if __name__=='__main__': main()
+        all_matches.extend(matches)
+
+    match_fields=["Season","MatchID","DateUTC","Round","Home","Away",
+                  "HomeTeamID","AwayTeamID","PageURL"]
+    player_fields=["Season","MatchID","DateUTC","Round","Home","Away","Side",
+                   "Team","StarterNo","PlayerID","Player","Position",
+                   "ShirtNumber","PageURL"]
+    write_csv(OUT/"serie_a_matches.csv",all_matches,match_fields)
+    write_csv(OUT/"serie_a_starting_xi.csv",all_players,player_fields)
+
+    coverage=[]
+    for m in all_matches:
+        ps=[p for p in all_players if str(p["MatchID"])==str(m["MatchID"])]
+        hc=sum(p["Side"]=="Home" for p in ps); ac=sum(p["Side"]=="Away" for p in ps)
+        coverage.append({
+            "Season":m["Season"],"MatchID":m["MatchID"],"DateUTC":m["DateUTC"],
+            "Home":m["Home"],"Away":m["Away"],
+            "HomeStarters":hc,"AwayStarters":ac,"CompleteXI":hc==11 and ac==11
+        })
+    write_csv(OUT/"serie_a_lineup_coverage.csv",coverage,
+              ["Season","MatchID","DateUTC","Home","Away",
+               "HomeStarters","AwayStarters","CompleteXI"])
+    write_csv(OUT/"missing_lineups.csv",missing,match_fields+["Reason"])
+
+    complete=sum(r["CompleteXI"] for r in coverage)
+    print("\nDONE")
+    print(f"Matches: {len(all_matches)}")
+    print(f"Starting-player rows: {len(all_players)}")
+    print(f"Complete 11+11 lineups: {complete}/{len(coverage)}")
+    if len(all_matches) and complete < 0.90*len(all_matches):
+        raise SystemExit(
+            "Coverage below 90%. Outputs were still written/uploaded for diagnosis."
+        )
+
+if __name__=="__main__":
+    main()
