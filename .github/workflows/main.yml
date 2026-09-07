@@ -1,10 +1,10 @@
-name: Diagnose FotMob Serie A lineup structure (v6)
+name: Extract Serie A starting XIs (FotMob v7)
 
 on:
   workflow_dispatch:
     inputs:
       season:
-        description: "Season to inspect"
+        description: "Season to extract"
         required: true
         default: "2021-22"
         type: choice
@@ -14,14 +14,15 @@ on:
           - "2023-24"
           - "2024-25"
           - "2025-26"
+          - "all"
 
 permissions:
   contents: read
 
 jobs:
-  diagnose:
+  extract:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 180
 
     steps:
       - name: Check out repository
@@ -35,28 +36,37 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Diagnose first match only
+      - name: Extract lineups
         run: |
-          python diagnose_fotmob_lineup.py \
+          python extract_serie_a_lineups.py \
             --season "${{ inputs.season }}"
 
-      - name: Show diagnostic files
+      - name: Show coverage
         if: always()
         run: |
-          echo "Diagnostic files:"
-          find data/diagnostics -maxdepth 1 -type f -printf "%f  %s bytes\n" | sort || true
+          echo "Processed files:"
+          ls -lh data/processed || true
           echo
-          echo "Candidate containers:"
-          cat data/diagnostics/candidate_containers.txt || true
-          echo
-          echo "Keyword paths:"
-          head -200 data/diagnostics/keyword_paths.txt || true
+          if [ -f data/processed/serie_a_lineup_coverage.csv ]; then
+            python - <<'PY'
+          import pandas as pd
+          p="data/processed/serie_a_lineup_coverage.csv"
+          df=pd.read_csv(p)
+          print(df.groupby("Season").agg(
+              matches=("MatchID","size"),
+              complete=("CompleteXI","sum"),
+              avg_home=("HomeStarters","mean"),
+              avg_away=("AwayStarters","mean"),
+          ))
+          PY
+          fi
 
-      - name: Upload diagnostic artifact
+      - name: Upload CSV outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fotmob-lineup-diagnostics-${{ inputs.season }}
-          path: data/diagnostics/
+          name: serie-a-lineups-v7-${{ inputs.season }}
+          path: |
+            data/processed/*.csv
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 30
