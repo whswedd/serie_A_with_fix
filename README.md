@@ -1,39 +1,42 @@
-# Serie A FotMob lineup diagnostic — v6
+# Serie A FotMob starting-XI extractor — v7
 
-This version does not run a full season.
+v7 fixes the two issues found in the diagnostic run:
 
-It fetches:
-1. one Serie A league page;
-2. the **first match only** for the selected season;
-3. the full embedded Next.js `__NEXT_DATA__`;
-4. every JSON path likely to contain lineup/player/starter/bench information.
+1. It uses a server-visible historical match route:
+   `https://www.fotmob.com/match/<matchId>`
 
-## Run it
+   This is important because the older league-page URL stores the match ID after
+   `#`, and URL fragments are not sent to the server.
 
-GitHub:
+2. It parses the confirmed historical lineup paths:
+   - `content.lineup.homeTeam.starters`
+   - `content.lineup.awayTeam.starters`
 
-**Actions → Diagnose FotMob Serie A lineup structure (v6) → Run workflow**
+The v6 diagnostic showed 11 players in each list.
 
-Choose `2021-22`.
+## Checkpointing
 
-The run should complete quickly because it requests only two pages.
+v7 writes the three output CSVs after every match, so cancelling a GitHub Actions
+run no longer loses all progress.
 
-## Artifact
+Outputs:
+- `data/processed/serie_a_matches.csv`
+- `data/processed/serie_a_starting_xi.csv`
+- `data/processed/serie_a_lineup_coverage.csv`
 
-Download:
+## Recommended first run
 
-`fotmob-lineup-diagnostics-2021-22`
+Run only `2021-22`.
 
-It contains:
+In the Actions log, the first match should show:
 
-- `league_page.html`
-- `match_page.html`
-- `next_data_full.json`
-- `pageprops.json`
-- `selected_match.json`
-- `keyword_paths.txt`
-- `candidate_containers.txt`
+`starters: home=11, away=11`
 
-The important files are `candidate_containers.txt` and `pageprops.json`.
+If that appears, allow the season to continue.
 
-Once we know FotMob's exact lineup structure, the full extractor can be rebuilt to checkpoint CSVs continuously rather than writing only at the end.
+## Expected complete-season result
+
+For 380 matches:
+- about 380 coverage rows
+- ideally 380 complete XIs
+- ideally 8,360 starter rows

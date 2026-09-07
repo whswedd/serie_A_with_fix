@@ -1,39 +1,32 @@
 #!/usr/bin/env python3
-"""
-Extract historical Serie A starting XIs from FotMob HTML pages.
-
-Why HTML instead of the JSON API?
-FotMob's protected matchDetails API can return 403 to automated clients.
-The normal league/match web pages still contain the required data in the
-Next.js __NEXT_DATA__ JSON embedded in the HTML.
-
-Outputs:
-  data/processed/serie_a_matches.csv
-  data/processed/serie_a_starting_xi.csv
-  data/processed/serie_a_lineup_coverage.csv
-  data/processed/missing_lineups.csv
-"""
-
 from __future__ import annotations
-import argparse, csv, json, random, re, time
+
+import argparse
+import csv
+import json
+import random
+import re
+import time
 from pathlib import Path
-from typing import Any
-from urllib.parse import urljoin
 
 import requests
 
 BASE = "https://www.fotmob.com"
 LEAGUE_ID = 55
-SEASONS = ["2021-22","2022-23","2023-24","2024-25","2025-26"]
+
 SEASON_QUERY = {
-    "2021-22":"2021-2022",
-    "2022-23":"2022-2023",
-    "2023-24":"2023-2024",
-    "2024-25":"2024-2025",
-    "2025-26":"2025-2026",
+    "2021-22": "2021-2022",
+    "2022-23": "2022-2023",
+    "2023-24": "2023-2024",
+    "2024-25": "2024-2025",
+    "2025-26": "2025-2026",
 }
-OUT = Path("data/processed")
+
+PROCESSED = Path("data/processed")
 RAW = Path("data/raw/fotmob")
+PROCESSED.mkdir(parents=True, exist_ok=True)
+RAW.mkdir(parents=True, exist_ok=True)
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -45,350 +38,343 @@ HEADERS = {
     "Cache-Control": "no-cache",
 }
 
-def season_url(season: str) -> str:
-    return f"{BASE}/leagues/{LEAGUE_ID}/overview/serie?season={SEASON_QUERY[season]}"
+MATCH_FIELDS = [
+    "Season","MatchID","DateUTC","Round","Home","Away",
+    "HomeTeamID","AwayTeamID","CanonicalURL"
+]
 
-def clean_slug(slug: str) -> str:
-    if not slug:
-        return ""
-    if slug.startswith("http"):
-        return slug
-    return urljoin(BASE, slug)
+PLAYER_FIELDS = [
+    "Season","MatchID","DateUTC","Round","Home","Away",
+    "Side","Team","Formation","StarterNo",
+    "PlayerID","Player","FirstName","LastName",
+    "PositionID","UsualPlayingPositionID","ShirtNumber",
+    "Age","CountryName","CountryCode","IsCaptain",
+    "MarketValue","Rating","CanonicalURL"
+]
 
-def request_html(session: requests.Session, url: str, cache: Path,
-                 retries: int = 6, force: bool = False) -> str:
-    if cache.exists() and not force:
-        return cache.read_text(encoding="utf-8", errors="replace")
+COVERAGE_FIELDS = [
+    "Season","MatchID","DateUTC","Round","Home","Away",
+    "HomeStarters","AwayStarters","CompleteXI","CanonicalURL","Error"
+]
 
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    last = None
-    for attempt in range(1, retries+1):
-        try:
-            r = session.get(url, timeout=45)
-            print(f"    GET {r.status_code} {url}")
-            if r.status_code == 200 and "__NEXT_DATA__" in r.text:
-                cache.write_text(r.text, encoding="utf-8")
-                return r.text
-            last = RuntimeError(
-                f"status={r.status_code}, len={len(r.text)}, "
-                f"next_data={'__NEXT_DATA__' in r.text}"
-            )
-        except Exception as e:
-            last = e
-        if attempt < retries:
-            time.sleep(min(30, (2**(attempt-1))) + random.uniform(.5, 1.5))
-    raise RuntimeError(f"Failed after {retries} attempts: {url}; last={last}")
-
-def next_data(html: str) -> dict:
-    m = re.search(
-        r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
-        html, flags=re.S
-    )
-    if not m:
-        raise ValueError("__NEXT_DATA__ script not found")
-    wrapper = json.loads(m.group(1))
-    return wrapper.get("props", {}).get("pageProps", {})
-
-def find_allmatches(obj: Any):
-    """Find the largest plausible allMatches list anywhere in pageProps."""
-    found = []
-    def walk(x):
-        if isinstance(x, dict):
-            for k,v in x.items():
-                if k == "allMatches" and isinstance(v, list):
-                    found.append(v)
-                else:
-                    walk(v)
-        elif isinstance(x, list):
-            for v in x:
-                walk(v)
-    walk(obj)
-    if not found:
-        return []
-    return max(found, key=len)
-
-def first(d: dict, *names, default=None):
+def first(d, *names, default=None):
+    if not isinstance(d, dict):
+        return default
     for n in names:
         if n in d and d[n] is not None:
             return d[n]
     return default
 
 def nested_name(x):
-    if isinstance(x, str): return x
-    if not isinstance(x, dict): return None
+    if isinstance(x, str):
+        return x
+    if not isinstance(x, dict):
+        return ""
     n = x.get("name")
-    if isinstance(n, str): return n
+    if isinstance(n, str):
+        return n
     if isinstance(n, dict):
-        return n.get("fullName") or n.get("name")
-    return x.get("fullName") or x.get("shortName")
+        return n.get("fullName") or n.get("name") or ""
+    return x.get("fullName") or x.get("shortName") or ""
 
-def match_row(m: dict, season: str) -> dict:
-    home = m.get("home") or m.get("homeTeam") or {}
-    away = m.get("away") or m.get("awayTeam") or {}
-    status = m.get("status") or {}
-    return {
-        "Season": season,
-        "MatchID": first(m, "id", "matchId"),
-        "DateUTC": first(status, "utcTime", default=first(m, "matchTimeUTCDate","date")),
-        "Round": first(m, "round", "roundName", "roundId", default=""),
-        "Home": nested_name(home) or first(m,"homeName", default=""),
-        "Away": nested_name(away) or first(m,"awayName", default=""),
-        "HomeTeamID": first(home,"id","teamId", default=""),
-        "AwayTeamID": first(away,"id","teamId", default=""),
-        "PageURL": clean_slug(first(m,"pageUrl","pageURL","url", default="")),
-    }
+def league_url(season):
+    return f"{BASE}/leagues/{LEAGUE_ID}/overview/serie?season={SEASON_QUERY[season]}"
 
-def get_lineup_obj(pageprops: dict):
-    content = pageprops.get("content") or {}
-    if isinstance(content, dict) and "lineup" in content:
-        return content.get("lineup") or {}
-    # fallback recursive lookup
-    stack=[pageprops]
-    while stack:
-        x=stack.pop()
-        if isinstance(x,dict):
-            if "lineup" in x and isinstance(x["lineup"],dict):
-                return x["lineup"]
-            stack.extend(x.values())
-        elif isinstance(x,list):
-            stack.extend(x)
-    return {}
+def match_url(match_id):
+    # Important: server-visible historical ID, NOT a #fragment.
+    return f"{BASE}/match/{match_id}"
 
-def player_name(p: dict):
-    for key in ("name","playerName","fullName"):
-        v=p.get(key)
-        if isinstance(v,str): return v
-        if isinstance(v,dict):
-            z=v.get("fullName") or v.get("name")
-            if z: return z
-    pl=p.get("player")
-    if isinstance(pl,dict):
-        return player_name(pl)
-    return ""
+def get_html(session, url, cache=None, retries=5, force=False):
+    if cache and cache.exists() and not force:
+        return cache.read_text(encoding="utf-8", errors="replace"), None
 
-def player_id(p: dict):
-    for key in ("id","playerId"):
-        if p.get(key) is not None:
-            return p.get(key)
-    pl=p.get("player")
-    if isinstance(pl,dict):
-        return pl.get("id") or pl.get("playerId")
-    return ""
-
-def player_position(p: dict):
-    for key in ("position","positionId","positionLabel","role"):
-        v=p.get(key)
-        if isinstance(v,str): return v
-        if isinstance(v,dict):
-            return v.get("label") or v.get("name") or v.get("shortName") or ""
-        if v is not None: return str(v)
-    pl=p.get("player")
-    if isinstance(pl,dict):
-        return player_position(pl)
-    return ""
-
-def is_bench_player(p: dict) -> bool:
-    # Explicit flags where available.
-    if p.get("isStarter") is True or p.get("starter") is True:
-        return False
-    if p.get("isStarter") is False or p.get("starter") is False:
-        return True
-    if p.get("isSubstitute") is True or p.get("substitute") is True:
-        return True
-    return False
-
-def flatten_players(x):
-    """Yield player-like dicts from nested lineup arrays without duplicating them."""
-    out=[]
-    seen=set()
-    def walk(v):
-        if isinstance(v,dict):
-            pid=player_id(v); nm=player_name(v)
-            playerish = bool(pid or nm) and any(
-                k in v for k in ("position","positionId","shirt","shirtNumber",
-                                 "playerId","isStarter","starter","isSubstitute")
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = session.get(url, timeout=60, allow_redirects=True)
+            print(f"    GET {r.status_code} {url} -> {r.url}", flush=True)
+            if r.status_code == 200 and "__NEXT_DATA__" in r.text:
+                if cache:
+                    cache.parent.mkdir(parents=True, exist_ok=True)
+                    cache.write_text(r.text, encoding="utf-8")
+                return r.text, r.url
+            last = RuntimeError(
+                f"status={r.status_code}, final={r.url}, "
+                f"next_data={'__NEXT_DATA__' in r.text}"
             )
-            if playerish:
-                key=(str(pid),nm)
-                if key not in seen:
-                    seen.add(key); out.append(v)
-            else:
-                for z in v.values(): walk(z)
-        elif isinstance(v,list):
-            for z in v: walk(z)
-    walk(x)
-    return out
+        except Exception as e:
+            last = e
 
-def parse_starting_xi(pageprops: dict, match: dict):
-    lineup=get_lineup_obj(pageprops)
-    rows=[]
-    if not lineup:
-        return rows
+        if attempt < retries:
+            time.sleep(min(20, 2 ** (attempt - 1)) + random.uniform(.4, 1.2))
 
-    home_id=str(match["HomeTeamID"])
-    away_id=str(match["AwayTeamID"])
+    raise RuntimeError(f"Failed after {retries} attempts: {url}; last={last}")
 
-    # Modern shape: lineup.lineups = [{teamId, teamName, players:[...]} ...]
-    teams = lineup.get("lineups")
-    if isinstance(teams,list):
-        for t in teams:
-            tid=str(first(t,"teamId","id", default=""))
-            side = "Home" if tid==home_id else ("Away" if tid==away_id else "")
-            tname=first(t,"teamName","name", default="")
-            players=t.get("players") or t.get("lineup") or []
-            # In this structure players are typically the XI. Filter explicit bench flags anyway.
-            plist=[p for p in flatten_players(players) if not is_bench_player(p)]
-            # Prefer first 11 if nested data added duplicates/extras.
-            if len(plist)>11:
-                starter_flagged=[p for p in plist if p.get("isStarter") is True or p.get("starter") is True]
-                if len(starter_flagged)==11: plist=starter_flagged
-                else: plist=plist[:11]
-            for seq,p in enumerate(plist,1):
-                rows.append(make_player_row(match,side,tname,seq,p))
-        if rows:
-            return rows
+def next_data(html):
+    m = re.search(
+        r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+        html,
+        flags=re.S
+    )
+    if not m:
+        raise RuntimeError("__NEXT_DATA__ not found")
+    return json.loads(m.group(1))
 
-    # Older shape commonly has a paired starting lineup array plus paired bench arrays.
-    # Search named keys that imply STARTERS, explicitly excluding bench/substitute keys.
-    candidate_arrays=[]
-    def collect_named(d):
-        if isinstance(d,dict):
-            for k,v in d.items():
-                kl=k.lower()
-                if isinstance(v,list) and ("lineup" in kl or "starter" in kl):
-                    if "bench" not in kl and "sub" not in kl:
-                        candidate_arrays.append((k,v))
-                elif isinstance(v,(dict,list)):
-                    collect_named(v)
-        elif isinstance(d,list):
-            for v in d: collect_named(v)
-    collect_named(lineup)
+def pageprops(wrapper):
+    return wrapper.get("props", {}).get("pageProps", {})
 
-    for _,arr in candidate_arrays:
-        # Often [homeXI, awayXI]
-        if len(arr)==2 and all(isinstance(z,list) for z in arr):
-            for side,tname,players in [
-                ("Home",match["Home"],arr[0]),("Away",match["Away"],arr[1])
-            ]:
-                plist=[p for p in flatten_players(players) if not is_bench_player(p)][:11]
-                for seq,p in enumerate(plist,1):
-                    rows.append(make_player_row(match,side,tname,seq,p))
-            if rows:
-                return rows
+def find_allmatches(obj):
+    found = []
+    def walk(x):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if k == "allMatches" and isinstance(v, list):
+                    found.append(v)
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(obj)
+    return max(found, key=len) if found else []
 
+def discover_matches(session, season, force=False):
+    html, _ = get_html(
+        session,
+        league_url(season),
+        RAW/"league"/f"{season}.html",
+        force=force,
+    )
+    props = pageprops(next_data(html))
+    raw_matches = find_allmatches(props)
+    if not raw_matches:
+        raise RuntimeError(f"No matches discovered for {season}")
+
+    rows = []
+    for m in raw_matches:
+        status = m.get("status") or {}
+        home = m.get("home") or m.get("homeTeam") or {}
+        away = m.get("away") or m.get("awayTeam") or {}
+        mid = first(m, "id", "matchId", default="")
+        if not mid:
+            continue
+        rows.append({
+            "Season": season,
+            "MatchID": mid,
+            "DateUTC": first(
+                status, "utcTime",
+                default=first(m, "matchTimeUTCDate", "date", default="")
+            ),
+            "Round": first(m, "round", "roundName", "roundId", default=""),
+            "Home": nested_name(home) or first(m, "homeName", default=""),
+            "Away": nested_name(away) or first(m, "awayName", default=""),
+            "HomeTeamID": first(home, "id", "teamId", default=""),
+            "AwayTeamID": first(away, "id", "teamId", default=""),
+            "CanonicalURL": "",
+        })
+
+    uniq = {str(x["MatchID"]): x for x in rows}
+    rows = sorted(uniq.values(), key=lambda x: str(x["DateUTC"]))
+    print(f"  Discovered {len(rows)} matches", flush=True)
     return rows
 
-def make_player_row(match, side, team_name, seq, p):
+def extract_player(p, match, side, team_name, formation, seq, canonical_url):
+    country = p.get("country") or {}
     return {
-        "Season":match["Season"],"MatchID":match["MatchID"],
-        "DateUTC":match["DateUTC"],"Round":match["Round"],
-        "Home":match["Home"],"Away":match["Away"],
-        "Side":side,"Team":team_name,"StarterNo":seq,
-        "PlayerID":player_id(p),"Player":player_name(p),
-        "Position":player_position(p),
-        "ShirtNumber":first(p,"shirtNumber","shirt", default=""),
-        "PageURL":match["PageURL"],
+        "Season": match["Season"],
+        "MatchID": match["MatchID"],
+        "DateUTC": match["DateUTC"],
+        "Round": match["Round"],
+        "Home": match["Home"],
+        "Away": match["Away"],
+        "Side": side,
+        "Team": team_name,
+        "Formation": formation,
+        "StarterNo": seq,
+        "PlayerID": first(p, "id", "playerId", default=""),
+        "Player": first(p, "name", "playerName", "fullName", default=""),
+        "FirstName": first(p, "firstName", default=""),
+        "LastName": first(p, "lastName", default=""),
+        "PositionID": first(p, "positionId", "position", default=""),
+        "UsualPlayingPositionID": first(p, "usualPlayingPositionId", default=""),
+        "ShirtNumber": first(p, "shirtNumber", "shirt", default=""),
+        "Age": first(p, "age", default=""),
+        "CountryName": first(country, "name", default=""),
+        "CountryCode": first(country, "code", "countryCode", default=""),
+        "IsCaptain": first(p, "isCaptain", "captain", default=False),
+        "MarketValue": first(p, "marketValue", default=""),
+        "Rating": first(p, "rating", default=""),
+        "CanonicalURL": canonical_url,
     }
 
-def write_csv(path: Path, rows, fields):
+def parse_lineup(props, match, final_url):
+    content = props.get("content") or {}
+    lineup = content.get("lineup") or {}
+
+    home = lineup.get("homeTeam") or {}
+    away = lineup.get("awayTeam") or {}
+
+    home_starters = home.get("starters") or []
+    away_starters = away.get("starters") or []
+
+    rows = []
+    for seq, p in enumerate(home_starters, 1):
+        rows.append(extract_player(
+            p, match, "Home",
+            first(home, "name", default=match["Home"]),
+            first(home, "formation", default=""),
+            seq, final_url
+        ))
+
+    for seq, p in enumerate(away_starters, 1):
+        rows.append(extract_player(
+            p, match, "Away",
+            first(away, "name", default=match["Away"]),
+            first(away, "formation", default=""),
+            seq, final_url
+        ))
+
+    return rows, len(home_starters), len(away_starters)
+
+def read_csv(path):
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+def write_csv(path, rows, fields):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w=csv.DictWriter(f, fieldnames=fields)
-        w.writeheader(); w.writerows(rows)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+    tmp.replace(path)
+
+def checkpoint(matches, players, coverage):
+    write_csv(PROCESSED/"serie_a_matches.csv", matches, MATCH_FIELDS)
+    write_csv(PROCESSED/"serie_a_starting_xi.csv", players, PLAYER_FIELDS)
+    write_csv(PROCESSED/"serie_a_lineup_coverage.csv", coverage, COVERAGE_FIELDS)
 
 def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument("--season", choices=["all"]+SEASONS, default="all")
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--season",
+        choices=list(SEASON_QUERY) + ["all"],
+        default="2021-22"
+    )
     ap.add_argument("--force", action="store_true")
-    ap.add_argument("--delay-min", type=float, default=0.8)
-    ap.add_argument("--delay-max", type=float, default=1.5)
-    args=ap.parse_args()
-    seasons=SEASONS if args.season=="all" else [args.season]
+    ap.add_argument("--delay", type=float, default=0.8)
+    args = ap.parse_args()
 
-    session=requests.Session()
+    seasons = list(SEASON_QUERY) if args.season == "all" else [args.season]
+
+    session = requests.Session()
     session.headers.update(HEADERS)
 
-    all_matches=[]
-    all_players=[]
-    missing=[]
+    existing_matches = read_csv(PROCESSED/"serie_a_matches.csv")
+    existing_players = read_csv(PROCESSED/"serie_a_starting_xi.csv")
+    existing_coverage = read_csv(PROCESSED/"serie_a_lineup_coverage.csv")
+
+    # Resume only complete 11+11 matches.
+    completed = {
+        str(r["MatchID"])
+        for r in existing_coverage
+        if str(r.get("CompleteXI","")).lower() == "true"
+    }
+
+    all_matches = existing_matches[:]
+    all_players = existing_players[:]
+    all_coverage = existing_coverage[:]
+
+    known_match_ids = {str(r["MatchID"]) for r in all_matches}
 
     for season in seasons:
-        print(f"\n=== {season} ===")
-        html=request_html(session, season_url(season),
-                          RAW/"league"/f"{season}.html", force=args.force)
-        props=next_data(html)
-        raw_matches=find_allmatches(props)
-        matches=[]
-        for m in raw_matches:
-            row=match_row(m,season)
-            if row["MatchID"] and row["Home"] and row["Away"]:
-                matches.append(row)
+        print(f"\n=== {season} ===", flush=True)
+        season_matches = discover_matches(session, season, force=args.force)
 
-        # Deduplicate by MatchID.
-        uniq={str(m["MatchID"]):m for m in matches}
-        matches=list(uniq.values())
-        matches.sort(key=lambda z: str(z["DateUTC"]))
-        print(f"  Discovered {len(matches)} matches")
-        if len(matches)<350:
-            print("  WARNING: fewer than 350 matches discovered; check league page cache.")
+        for m in season_matches:
+            mid = str(m["MatchID"])
 
-        for i,m in enumerate(matches,1):
-            print(f"  [{i:03d}/{len(matches):03d}] {m['Home']} vs {m['Away']}")
-            if not m["PageURL"]:
-                missing.append({**m,"Reason":"No PageURL in league page"})
+            if mid not in known_match_ids:
+                all_matches.append(m)
+                known_match_ids.add(mid)
+                checkpoint(all_matches, all_players, all_coverage)
+
+            if mid in completed and not args.force:
+                print(f"  SKIP complete {m['Home']} vs {m['Away']} ({mid})", flush=True)
                 continue
+
+            print(f"  {m['Home']} vs {m['Away']} ({mid})", flush=True)
+
+            error = ""
+            final_url = ""
             try:
-                html=request_html(
-                    session,m["PageURL"],
-                    RAW/"matches"/season/f"{m['MatchID']}.html",
-                    force=args.force
+                cache = RAW/"matches"/season/f"{mid}.html"
+                html, final_url = get_html(
+                    session, match_url(mid), cache, force=args.force
                 )
-                props=next_data(html)
-                players=parse_starting_xi(props,m)
-                hc=sum(1 for p in players if p["Side"]=="Home")
-                ac=sum(1 for p in players if p["Side"]=="Away")
-                print(f"       starters: home={hc}, away={ac}")
-                if hc!=11 or ac!=11:
-                    missing.append({**m,"Reason":f"Parsed starters home={hc}, away={ac}"})
-                all_players.extend(players)
+                props = pageprops(next_data(html))
+
+                rows, hc, ac = parse_lineup(props, m, final_url or match_url(mid))
+                print(f"       starters: home={hc}, away={ac}", flush=True)
+
+                # Remove any prior partial rows for this match before replacing them.
+                all_players = [r for r in all_players if str(r["MatchID"]) != mid]
+                all_coverage = [r for r in all_coverage if str(r["MatchID"]) != mid]
+
+                all_players.extend(rows)
+
+                complete = (hc == 11 and ac == 11)
+                all_coverage.append({
+                    "Season": m["Season"],
+                    "MatchID": m["MatchID"],
+                    "DateUTC": m["DateUTC"],
+                    "Round": m["Round"],
+                    "Home": m["Home"],
+                    "Away": m["Away"],
+                    "HomeStarters": hc,
+                    "AwayStarters": ac,
+                    "CompleteXI": complete,
+                    "CanonicalURL": final_url,
+                    "Error": "",
+                })
+
+                if complete:
+                    completed.add(mid)
+
             except Exception as e:
-                print(f"       ERROR: {e}")
-                missing.append({**m,"Reason":str(e)})
-            time.sleep(random.uniform(args.delay_min,args.delay_max))
+                error = str(e)
+                print(f"       ERROR: {error}", flush=True)
 
-        all_matches.extend(matches)
+                all_coverage = [r for r in all_coverage if str(r["MatchID"]) != mid]
+                all_coverage.append({
+                    "Season": m["Season"],
+                    "MatchID": m["MatchID"],
+                    "DateUTC": m["DateUTC"],
+                    "Round": m["Round"],
+                    "Home": m["Home"],
+                    "Away": m["Away"],
+                    "HomeStarters": 0,
+                    "AwayStarters": 0,
+                    "CompleteXI": False,
+                    "CanonicalURL": final_url,
+                    "Error": error,
+                })
 
-    match_fields=["Season","MatchID","DateUTC","Round","Home","Away",
-                  "HomeTeamID","AwayTeamID","PageURL"]
-    player_fields=["Season","MatchID","DateUTC","Round","Home","Away","Side",
-                   "Team","StarterNo","PlayerID","Player","Position",
-                   "ShirtNumber","PageURL"]
-    write_csv(OUT/"serie_a_matches.csv",all_matches,match_fields)
-    write_csv(OUT/"serie_a_starting_xi.csv",all_players,player_fields)
+            # Critical v7 behavior: persist after every match.
+            checkpoint(all_matches, all_players, all_coverage)
+            time.sleep(args.delay)
 
-    coverage=[]
-    for m in all_matches:
-        ps=[p for p in all_players if str(p["MatchID"])==str(m["MatchID"])]
-        hc=sum(p["Side"]=="Home" for p in ps); ac=sum(p["Side"]=="Away" for p in ps)
-        coverage.append({
-            "Season":m["Season"],"MatchID":m["MatchID"],"DateUTC":m["DateUTC"],
-            "Home":m["Home"],"Away":m["Away"],
-            "HomeStarters":hc,"AwayStarters":ac,"CompleteXI":hc==11 and ac==11
-        })
-    write_csv(OUT/"serie_a_lineup_coverage.csv",coverage,
-              ["Season","MatchID","DateUTC","Home","Away",
-               "HomeStarters","AwayStarters","CompleteXI"])
-    write_csv(OUT/"missing_lineups.csv",missing,match_fields+["Reason"])
+    complete_count = sum(
+        str(r.get("CompleteXI","")).lower() == "true"
+        for r in all_coverage
+        if r.get("Season") in seasons
+    )
+    season_cov = [r for r in all_coverage if r.get("Season") in seasons]
 
-    complete=sum(r["CompleteXI"] for r in coverage)
-    print("\nDONE")
-    print(f"Matches: {len(all_matches)}")
-    print(f"Starting-player rows: {len(all_players)}")
-    print(f"Complete 11+11 lineups: {complete}/{len(coverage)}")
-    if len(all_matches) and complete < 0.90*len(all_matches):
-        raise SystemExit(
-            "Coverage below 90%. Outputs were still written/uploaded for diagnosis."
-        )
+    print("\nDONE", flush=True)
+    print(f"Coverage rows: {len(season_cov)}", flush=True)
+    print(f"Complete 11+11: {complete_count}/{len(season_cov)}", flush=True)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
